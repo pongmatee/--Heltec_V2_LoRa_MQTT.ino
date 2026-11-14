@@ -1,0 +1,729 @@
+
+#include <Arduino.h>
+#include <SPI.h>
+#include <LoRa.h>
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+#include <PubSubClient.h>
+#include <Preferences.h>
+
+// =====================================================
+// 1) WIFI + THINGSPEAK
+// =====================================================
+// ใส่ค่าการเชื่อมต่อเดิมของคุณในส่วนนี้
+const char* WIFI_SSID = "TP-Link_8872";
+const char* WIFI_PASSWORD = "Kmitl12345";
+const char* THINGSPEAK_API_KEY = "O1MLUAOCUYYKXMIT";
+
+// =====================================================
+// 2) THINGSPEAK TALKBACK
+// =====================================================
+const char* TALKBACK_ID = "58402";
+const char* TALKBACK_API_KEY = "6AZACEGC9R3ZGX1B";
+
+// =====================================================
+// 3) MQTT
+// =====================================================
+const char* MQTT_SERVER = "13.212.181.250";
+const uint16_t MQTT_PORT = 1883;
+const char* MQTT_TOPIC = "garden/soil";
+
+const char* MQTT_USERNAME = "group1_user";
+const char* MQTT_PASSWORD = "1234";
+const char* MQTT_CLIENT_ID = "HeltecV2-SoilReceiver-01";
+
+// =====================================================
+// 4) HELTEC V2 SX1276
+// =====================================================
+#define LORA_SCK   5
+#define LORA_MISO  19
+#define LORA_MOSI  27
+#define LORA_SS    18
+#define LORA_RST   14
+#define LORA_DIO0  26
+
+const long LORA_FREQ = 915E6;
+const long LORA_BW = 125E3;
+const int LORA_SF = 7;
+const int LORA_CR = 5;
+const byte LORA_SYNC_WORD = 0x12;
+
+// =====================================================
+// 5) TIMING
+// =====================================================
+const unsigned long LINK_TIMEOUT = 25000UL;
+const unsigned long STATUS_INTERVAL = 10000UL;
+const unsigned long WIFI_CHECK_INTERVAL = 5000UL;
+const unsigned long WIFI_RECONNECT_INTERVAL = 15000UL;
+const unsigned long MQTT_RECONNECT_INTERVAL = 5000UL;
+
+const unsigned long THINGSPEAK_UPLOAD_INTERVAL = 900000UL;
+const unsigned long THINGSPEAK_RETRY_INTERVAL = 5000UL;
+const unsigned long TALKBACK_POLL_INTERVAL = 5000UL;
+
+// =====================================================
+// 6) CLIENTS + VARIABLES
+// =====================================================
+WiFiClient mqttWifiClient;
+PubSubClient mqttClient(mqttWifiClient);
+Preferences preferences;
+
+unsigned long lastPacketTime = 0;
+unsigned long lastStatusTime = 0;
+unsigned long lastWiFiCheck = 0;
+unsigned long lastWiFiAttempt = 0;
+unsigned long lastMqttAttempt = 0;
+unsigned long lastThingSpeakSuccess = 0;
+unsigned long lastThingSpeakAttempt = 0;
+unsigned long lastTalkBackPoll = 0;
+unsigned long recordCount = 0;
+
+bool hasRecord = false;
+bool linkLostReported = false;
+bool pendingMqtt = false;
+bool hasThingSpeakSuccess = false;
+
+// ค่าเริ่มต้น
+float pumpOnThreshold = 35.0;
+float pumpOffThreshold = 60.0;
+int calculatedPumpState = 0;
+
+struct SoilRecord {
+  int rawValue;
+  float moisture;
+  int pumpState;
+  int rssi;
+  float snr;
+  unsigned long receivedAt;
+};
+
+SoilRecord latestRecord;
+
+// =====================================================
+// 7) SOIL CONDITION
+// =====================================================
+const char* getSoilCondition(float moisture) {
+  if (moisture < 35.0) return "ดินแห้ง";
+  if (moisture < 70.0) return "ดินชื้น";
+  return "ดินเปียก";
+}
+
+const char* getSignalQuality(int rssi, float snr) {
+  if (rssi >= -100 && snr >= -7.0) return "สัญญาณดี";
+  return "สัญญาณอ่อน";
+}
+
+// =====================================================
+// 8) READ LORA FIELD
+// =====================================================
+bool getField(
+  const String& data,
+  const String& key,
+  String& output
+) {
+  int start = data.indexOf(key);
+  if (start < 0) return false;
+
+  start += key.length();
+
+  int end = data.indexOf(',', start);
+  if (end < 0) end = data.length();
+
+  output = data.substring(start, end);
+  output.trim();
+
+  return output.length() > 0;
+}
+
+// =====================================================
+// 9) CALCULATE PUMP WITH HYSTERESIS
+// =====================================================
+void calculatePumpState() {
+  if (!hasRecord) return;
+
+  if (calculatedPumpState == 0 &&
+      latestRecord.moisture < pumpOnThreshold) {
+    calculatedPumpState = 1;
+  }
+  else if (calculatedPumpState == 1 &&
+           latestRecord.moisture >= pumpOffThreshold) {
+    calculatedPumpState = 0;
+  }
+
+  latestRecord.pumpState = calculatedPumpState;
+}
+
+// =====================================================
+// 10) SAVE SETTINGS
+// =====================================================
+void saveSettings() {
+  preferences.begin("soil-settings", false);
+  preferences.putFloat("on", pumpOnThreshold);
+  preferences.putFloat("off", pumpOffThreshold);
+  preferences.putInt("pump", calculatedPumpState);
+  preferences.end();
+}
+
+void loadSettings() {
+  preferences.begin("soil-settings", true);
+
+  pumpOnThreshold = preferences.getFloat("on", 35.0);
+  pumpOffThreshold = preferences.getFloat("off", 60.0);
+  calculatedPumpState = preferences.getInt("pump", 0);
+
+  preferences.end();
+
+  if (pumpOnThreshold < 0 ||
+      pumpOffThreshold > 100 ||
+      pumpOnThreshold >= pumpOffThreshold) {
+    pumpOnThreshold = 35.0;
+    pumpOffThreshold = 60.0;
+    calculatedPumpState = 0;
+  }
+
+  Serial.println("Loaded pump settings:");
+  Serial.print("ON threshold: ");
+  Serial.println(pumpOnThreshold);
+  Serial.print("OFF threshold: ");
+  Serial.println(pumpOffThreshold);
+}
+
+// =====================================================
+// 11) APPLY ON/OFF COMMAND
+// =====================================================
+bool applyPumpSettings(String command) {
+  command.trim();
+
+  int onPosition = command.indexOf("ON=");
+  int offPosition = command.indexOf("OFF=");
+
+  if (onPosition < 0 || offPosition < 0) {
+    Serial.println("Invalid TalkBack command");
+    return false;
+  }
+
+  String onText = command.substring(onPosition + 3, offPosition);
+  String offText = command.substring(offPosition + 4);
+
+  onText.trim();
+  offText.trim();
+
+  float newOn = onText.toFloat();
+  float newOff = offText.toFloat();
+
+  if (newOn < 0 || newOn >= newOff || newOff > 100) {
+    Serial.println("Invalid ON/OFF values");
+    return false;
+  }
+
+  pumpOnThreshold = newOn;
+  pumpOffThreshold = newOff;
+
+  Serial.println();
+  Serial.println("NEW PUMP SETTINGS RECEIVED");
+  Serial.print("ON = ");
+  Serial.println(pumpOnThreshold);
+  Serial.print("OFF = ");
+  Serial.println(pumpOffThreshold);
+
+  calculatePumpState();
+  saveSettings();
+
+  if (hasRecord) {
+    pendingMqtt = true;
+    displayRecord();
+  }
+
+  return true;
+}
+
+// =====================================================
+// 12) EXTRACT command_string FROM JSON
+// =====================================================
+String extractCommandString(const String& json) {
+  int keyPosition = json.indexOf("\"command_string\"");
+  if (keyPosition < 0) return "";
+
+  int colonPosition = json.indexOf(':', keyPosition);
+  if (colonPosition < 0) return "";
+
+  int firstQuote = json.indexOf('"', colonPosition + 1);
+  if (firstQuote < 0) return "";
+
+  int secondQuote = json.indexOf('"', firstQuote + 1);
+  if (secondQuote < 0) return "";
+
+  return json.substring(firstQuote + 1, secondQuote);
+}
+
+// =====================================================
+// 13) POLL THINGSPEAK TALKBACK
+// =====================================================
+void pollTalkBack() {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  unsigned long now = millis();
+
+  if (now - lastTalkBackPoll < TALKBACK_POLL_INTERVAL) {
+    return;
+  }
+
+  lastTalkBackPoll = now;
+
+  WiFiClientSecure secureClient;
+  secureClient.setInsecure();
+
+  HTTPClient https;
+  https.setTimeout(10000);
+
+  String url = "https://api.thingspeak.com/talkbacks/";
+  url += TALKBACK_ID;
+  url += "/commands/execute.json";
+
+  if (!https.begin(secureClient, url)) {
+    Serial.println("TalkBack connection failed");
+    return;
+  }
+
+  https.addHeader("Content-Type", "application/x-www-form-urlencoded");
+
+  String body = "api_key=";
+  body += TALKBACK_API_KEY;
+
+  Serial.println();
+  Serial.println("Checking ThingSpeak TalkBack...");
+
+  int httpCode = https.POST(body);
+  String response = "";
+
+  if (httpCode > 0) {
+    response = https.getString();
+    response.trim();
+
+    Serial.print("TalkBack HTTP: ");
+    Serial.println(httpCode);
+
+    if (httpCode == 200) {
+      if (response.length() == 0 || response == "{}") {
+        Serial.println("No new TalkBack command");
+      } else {
+        Serial.print("TalkBack response: ");
+        Serial.println(response);
+
+        String command = extractCommandString(response);
+
+        if (command.length() > 0) {
+          Serial.print("Command received: ");
+          Serial.println(command);
+
+          applyPumpSettings(command);
+        }
+      }
+    }
+  } else {
+    Serial.print("TalkBack error: ");
+    Serial.println(https.errorToString(httpCode));
+  }
+
+  https.end();
+}
+
+// =====================================================
+// 14) PARSE LORA PACKET
+// V3 sends RAW,MOISTURE,PUMP
+// V2 ignores V3 PUMP and calculates its own
+// =====================================================
+bool parsePacketData(const String& data) {
+  String rawText;
+  String moistureText;
+
+  if (!getField(data, "RAW=", rawText) ||
+      !getField(data, "MOISTURE=", moistureText)) {
+    return false;
+  }
+
+  int raw = rawText.toInt();
+  float moisture = moistureText.toFloat();
+
+  if (raw < 0 || raw > 4095) return false;
+  if (moisture < 0 || moisture > 100) return false;
+
+  latestRecord.rawValue = raw;
+  latestRecord.moisture = moisture;
+  latestRecord.rssi = LoRa.packetRssi();
+  latestRecord.snr = LoRa.packetSnr();
+  latestRecord.receivedAt = millis();
+
+  hasRecord = true;
+
+  calculatePumpState();
+
+  latestRecord.pumpState = calculatedPumpState;
+
+  return true;
+}
+
+// =====================================================
+// 15) DISPLAY DATA
+// =====================================================
+void displayRecord() {
+  Serial.println();
+  Serial.println("========== SOIL DATA ==========");
+
+  Serial.print("Record: ");
+  Serial.println(recordCount);
+
+  Serial.print("RAW: ");
+  Serial.println(latestRecord.rawValue);
+
+  Serial.print("Moisture: ");
+  Serial.print(latestRecord.moisture, 1);
+  Serial.println("%");
+
+  Serial.print("Soil condition: ");
+  Serial.println(getSoilCondition(latestRecord.moisture));
+
+  Serial.print("ON threshold: ");
+  Serial.println(pumpOnThreshold);
+
+  Serial.print("OFF threshold: ");
+  Serial.println(pumpOffThreshold);
+
+  Serial.print("Pump: ");
+  Serial.println(latestRecord.pumpState == 1 ? "ON" : "OFF");
+
+  Serial.print("RSSI: ");
+  Serial.print(latestRecord.rssi);
+  Serial.println(" dBm");
+
+  Serial.print("SNR: ");
+  Serial.print(latestRecord.snr, 1);
+  Serial.println(" dB");
+
+  Serial.print("Signal: ");
+  Serial.println(getSignalQuality(
+    latestRecord.rssi,
+    latestRecord.snr
+  ));
+
+  Serial.println("LoRa: CONNECTED");
+  Serial.println("===============================");
+}
+
+// =====================================================
+// 16) WIFI
+// =====================================================
+const char* getWiFiStatusText() {
+  switch (WiFi.status()) {
+    case WL_CONNECTED: return "CONNECTED";
+    case WL_NO_SSID_AVAIL: return "SSID NOT FOUND";
+    case WL_CONNECT_FAILED: return "CONNECTION FAILED";
+    case WL_CONNECTION_LOST: return "CONNECTION LOST";
+    case WL_DISCONNECTED: return "DISCONNECTED";
+    case WL_IDLE_STATUS: return "CONNECTING";
+    default: return "UNKNOWN";
+  }
+}
+
+void startWiFi() {
+  Serial.println();
+  Serial.println("Starting WiFi...");
+
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  lastWiFiAttempt = millis();
+}
+
+void checkWiFi() {
+  unsigned long now = millis();
+
+  if (now - lastWiFiCheck >= WIFI_CHECK_INTERVAL) {
+    lastWiFiCheck = now;
+
+    Serial.print("WiFi Status: ");
+    Serial.println(getWiFiStatusText());
+
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.print("IP Address: ");
+      Serial.println(WiFi.localIP());
+
+      Serial.print("WiFi RSSI: ");
+      Serial.println(WiFi.RSSI());
+    }
+  }
+
+  if (WiFi.status() != WL_CONNECTED &&
+      now - lastWiFiAttempt >= WIFI_RECONNECT_INTERVAL) {
+
+    Serial.println("WiFi disconnected! Reconnecting...");
+
+    WiFi.disconnect();
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+    lastWiFiAttempt = now;
+  }
+}
+
+// =====================================================
+// 17) MQTT CONNECT
+// =====================================================
+void connectMQTT() {
+  if (WiFi.status() != WL_CONNECTED ||
+      mqttClient.connected()) {
+    return;
+  }
+
+  unsigned long now = millis();
+
+  if (now - lastMqttAttempt < MQTT_RECONNECT_INTERVAL) {
+    return;
+  }
+
+  lastMqttAttempt = now;
+
+  Serial.println("Connecting MQTT...");
+
+  bool connected = mqttClient.connect(
+    MQTT_CLIENT_ID,
+    MQTT_USERNAME,
+    MQTT_PASSWORD
+  );
+
+  if (connected) {
+    Serial.println("MQTT CONNECTED!");
+  } else {
+    Serial.print("MQTT FAILED: ");
+    Serial.println(mqttClient.state());
+  }
+}
+
+// =====================================================
+// 18) PUBLISH MQTT
+// Only moisture and pump
+// =====================================================
+void publishToMQTT() {
+  if (!pendingMqtt || !mqttClient.connected()) return;
+
+  char payload[100];
+
+  snprintf(
+    payload,
+    sizeof(payload),
+    "{\"moisture\":%.1f,\"pump\":%d}",
+    latestRecord.moisture,
+    latestRecord.pumpState
+  );
+
+  Serial.println();
+  Serial.println("Publishing to MQTT...");
+  Serial.print("Payload: ");
+  Serial.println(payload);
+
+  if (mqttClient.publish(MQTT_TOPIC, payload)) {
+    Serial.println("MQTT PUBLISH SUCCESS!");
+    pendingMqtt = false;
+  } else {
+    Serial.println("MQTT PUBLISH FAILED - will retry");
+  }
+}
+
+// =====================================================
+// 19) THINGSPEAK UPLOAD
+// Field 1 = Moisture
+// Field 2 = Pump
+// =====================================================
+bool uploadToThingSpeak() {
+  if (WiFi.status() != WL_CONNECTED) return false;
+
+  WiFiClientSecure secureClient;
+  secureClient.setInsecure();
+
+  HTTPClient https;
+  https.setTimeout(15000);
+
+  String url = "https://api.thingspeak.com/update?api_key=";
+  url += THINGSPEAK_API_KEY;
+  url += "&field1=";
+  url += String(latestRecord.moisture, 1);
+  url += "&field2=";
+  url += String(latestRecord.pumpState);
+
+  if (!https.begin(secureClient, url)) {
+    return false;
+  }
+
+  int httpCode = https.GET();
+  String response = "";
+
+  if (httpCode > 0) {
+    response = https.getString();
+    response.trim();
+
+    Serial.print("ThingSpeak Entry ID: ");
+    Serial.println(response);
+  } else {
+    Serial.println(https.errorToString(httpCode));
+  }
+
+  https.end();
+
+  if (httpCode == 200 &&
+      response.length() > 0 &&
+      response != "0") {
+
+    Serial.println("ThingSpeak Upload SUCCESS!");
+
+    lastThingSpeakSuccess = millis();
+    hasThingSpeakSuccess = true;
+
+    return true;
+  }
+
+  Serial.println("ThingSpeak Upload FAILED");
+  return false;
+}
+
+// =====================================================
+// 20) SETUP
+// =====================================================
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  Serial.println();
+  Serial.println("======================================");
+  Serial.println("HELTEC V2 SOIL RECEIVER");
+  Serial.println("LoRa + WiFi + ThingSpeak + MQTT");
+  Serial.println("TalkBack Pump Control Enabled");
+  Serial.println("======================================");
+
+  loadSettings();
+
+  Serial.println("Starting LoRa...");
+
+  SPI.begin(
+    LORA_SCK,
+    LORA_MISO,
+    LORA_MOSI,
+    LORA_SS
+  );
+
+  LoRa.setPins(LORA_SS, LORA_RST, LORA_DIO0);
+
+  if (!LoRa.begin(LORA_FREQ)) {
+    Serial.println("LoRa initialization FAILED!");
+    while (true) delay(1000);
+  }
+
+  LoRa.setSpreadingFactor(LORA_SF);
+  LoRa.setSignalBandwidth(LORA_BW);
+  LoRa.setCodingRate4(LORA_CR);
+  LoRa.setSyncWord(LORA_SYNC_WORD);
+  LoRa.enableCrc();
+
+  Serial.println("LoRa initialized successfully");
+
+  mqttClient.setServer(MQTT_SERVER, MQTT_PORT);
+  mqttClient.setBufferSize(256);
+  mqttClient.setKeepAlive(30);
+  mqttClient.setSocketTimeout(5);
+
+  startWiFi();
+
+  Serial.println("Waiting for Heltec V3...");
+}
+
+// =====================================================
+// 21) MAIN LOOP
+// =====================================================
+void loop() {
+  unsigned long now = millis();
+
+  // Receive LoRa
+  int packetSize = LoRa.parsePacket();
+
+  if (packetSize > 0) {
+    String receivedData;
+    receivedData.reserve(100);
+
+    while (LoRa.available()) {
+      receivedData += (char)LoRa.read();
+    }
+
+    Serial.print("Received: ");
+    Serial.println(receivedData);
+
+    if (parsePacketData(receivedData)) {
+      recordCount++;
+
+      pendingMqtt = true;
+
+      lastPacketTime = millis();
+      linkLostReported = false;
+
+      displayRecord();
+    } else {
+      Serial.println("Invalid packet: ignored");
+    }
+  }
+
+  now = millis();
+
+  // Detect lost LoRa
+  if (hasRecord &&
+      now - lastPacketTime >= LINK_TIMEOUT &&
+      !linkLostReported) {
+
+    Serial.println("WARNING: No LoRa data for 25 seconds");
+    linkLostReported = true;
+  }
+
+  // WiFi
+  checkWiFi();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    // MQTT
+    if (!mqttClient.connected()) {
+      connectMQTT();
+    }
+
+    mqttClient.loop();
+    publishToMQTT();
+
+    // TalkBack
+    pollTalkBack();
+  }
+
+  // ThingSpeak upload
+  bool uploadDue =
+    !hasThingSpeakSuccess ||
+    (now - lastThingSpeakSuccess >= THINGSPEAK_UPLOAD_INTERVAL);
+
+  bool retryReady =
+    (lastThingSpeakAttempt == 0 ||
+     now - lastThingSpeakAttempt >= THINGSPEAK_RETRY_INTERVAL);
+
+  if (hasRecord &&
+      WiFi.status() == WL_CONNECTED &&
+      uploadDue &&
+      retryReady) {
+
+    lastThingSpeakAttempt = now;
+
+    Serial.println("ThingSpeak upload time");
+    uploadToThingSpeak();
+  }
+
+  // Waiting
+  if (!hasRecord &&
+      now - lastStatusTime >= STATUS_INTERVAL) {
+
+    lastStatusTime = now;
+    Serial.println("Waiting for Heltec V3...");
+  }
+
+  delay(5);
+}
